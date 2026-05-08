@@ -16,6 +16,8 @@ Competitive  —  Buy Phase  —  12 / 3 / 2
 [map image]  ⏱ 23:41
 ```
 
+![Preview](https://cdn.discordapp.com/attachments/1441220061602779147/1502292244802306250/Annotation_2026-05-08_173736.png?ex=69ff2e2e&is=69fddcae&hm=3b302550497ebe975a1106f1397f9ce89879b948055cc7cf0fcd915301186b22&)
+
 **in lobby:**
 ```
 Counter-Strike 2
@@ -23,6 +25,8 @@ Competitive  —  In Lobby
 In a Party
 👥 3 of 5
 ```
+
+![Preview 1](https://cdn.discordapp.com/attachments/1441220061602779147/1502292283423326219/Annotation_2026-05-08_175201.png?ex=69ff2e37&is=69fddcb7&hm=0ad719d6e2256f6459c5c0bdec2c7503315d74ce7e6c545a918e918fedfef883&)
 
 **on faceit:**
 ```
@@ -107,6 +111,8 @@ discord → settings → vencord → plugins → search `CS2RichPresence` → en
 | Show Score | on | ct vs t score, only shows in modes that have teams |
 | Show Round | on | current round number |
 | Clear on Menu | off | hide presence entirely when in menu instead of showing idle |
+
+![Preview 1](https://cdn.discordapp.com/attachments/1441220061602779147/1502293290190372954/InkedAnnotation_2026-05-08_174138_LI.jpg?ex=69ff2f27&is=69fddda7&hm=9daa4313457a1fcc69c47e2061bf107013f860911a4a9c2b74cb0d326face2c0&)
 
 ---
 
