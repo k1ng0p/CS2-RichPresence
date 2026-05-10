@@ -37,6 +37,8 @@ interface CS2State {
         round: number;
         team_ct?: { score: number };
         team_t?: { score: number };
+        // premier sets this to 1, competitive leaves it undefined/0
+        num_matches_to_win_series?: number;
     };
     round?: {
         phase: "freezetime" | "live" | "over" | "bomb";
@@ -112,6 +114,24 @@ interface SteamLobby {
 // faceit uses scrimcomp5 for 5v5, scrimcomp2 for 2v2
 // anything else thats not a valve mode = community server
 type ServerType = "valve" | "faceit" | "community";
+
+// active duty maps — only premier plays all of these via veto
+// competitive lets you pick specific maps so if we see a veto that used all of these, its premier
+const PREMIER_MAPS = new Set([
+    "de_dust2", "de_mirage", "de_inferno", "de_nuke",
+    "de_ancient", "de_anubis", "de_vertigo", "de_overpass",
+]);
+
+// cs2 sends mode="competitive" for BOTH competitive and premier
+// the only reliable gsi signal is num_matches_to_win_series:
+//   premier = 1 (bo1 from veto)
+//   competitive = 0 or undefined (you pick the map directly)
+function isPremier(gs: CS2State): boolean {
+    if (!gs.map) return false;
+    // num_matches_to_win_series is 1 in premier, not set in competitive
+    if (gs.map.num_matches_to_win_series === 1) return true;
+    return false;
+}
 
 function getServerType(gs: CS2State): ServerType {
     const mode = gs.map?.mode ?? "";
@@ -314,6 +334,11 @@ let inMatch = false;
 
 let steamLobby: SteamLobby = { lobbyId: null, partySize: 1 };
 
+// premier rating — fetched from steam user stats api, cached here
+// null = not fetched yet or player hasnt played premier
+let premierRating: number | null = null;
+let premierRatingFetched = false; // so we only try once per session
+
 // faceit live match data
 interface FaceitLive {
     matchId: string;
@@ -390,11 +415,40 @@ function startSteamPolling(steamId: string) {
 
     const tick = async () => {
         steamLobby = await fetchLobby(steamId);
+        // also grab premier rating if we havent yet
+        if (!premierRatingFetched) {
+            await fetchPremierRating(steamId);
+        }
         if (lastGS) buildAndSet(lastGS);
     };
 
     tick(); // run immediately dont wait 12s for first update
     steamTimer = setInterval(tick, STEAM_POLL);
+}
+
+// fetch premier cs rating from steam user stats
+// the stat is called "game_type_ranking_premier" in cs2's steam stats
+async function fetchPremierRating(steamId: string): Promise<void> {
+    premierRatingFetched = true; // mark as attempted regardless of result
+    try {
+        const res = await steamGet<{
+            playerstats?: {
+                stats?: Array<{ name: string; value: number }>;
+            };
+        }>("/ISteamUserStats/GetUserStatsForGame/v2/", {
+            steamid: steamId,
+            appid: CS2_STEAM_ID,
+        });
+
+        const stats = res?.playerstats?.stats ?? [];
+        const ratingEntry = stats.find(s => s.name === "game_type_ranking_premier");
+        if (ratingEntry && ratingEntry.value > 0) {
+            premierRating = ratingEntry.value;
+            logger.info(`premier rating: ${premierRating}`);
+        }
+    } catch (e) {
+        logger.warn("couldnt fetch premier rating:", e);
+    }
 }
 
 function stopSteamPolling() {
@@ -494,7 +548,8 @@ async function buildAndSet(gs: CS2State) {
     // track match state
     if (map) {
         inMatch = true;
-        if (map.mode) activeMode = map.mode;
+        // store the real resolved mode — "premier" instead of "competitive" when applicable
+        if (map.mode) activeMode = (map.mode === "competitive" && isPremier(gs)) ? "premier" : map.mode;
 
         if (map.name !== lastMapName) {
             lastMapName = map.name;
@@ -557,19 +612,31 @@ async function buildAndSet(gs: CS2State) {
         const ct = map.team_ct?.score ?? 0;
         const t = map.team_t?.score ?? 0;
         const rnd = map.round ?? 0;
-        const modeLabel = serverType === "community" ? "Community Server" : modeName(map.mode);
-        const max = maxParty(map.mode);
+
+        // figure out the real mode label
+        // cs2 sends mode="competitive" for both premier and competitive
+        // isPremier() uses num_matches_to_win_series to tell them apart
+        const isActuallyPremier = map.mode === "competitive" && isPremier(gs);
+        const resolvedMode = isActuallyPremier ? "premier" : map.mode;
+        const modeLabel = serverType === "community" ? "Community Server" : modeName(resolvedMode);
+        const max = maxParty(resolvedMode);
 
         let details = mn;
         if (serverType === "community") {
             details += "  —  Community Server";
-        } else if (settings.store.showScore && isTeamMode(map.mode) &&
+        } else if (settings.store.showScore && isTeamMode(resolvedMode) &&
             (map.phase === "live" || map.phase === "intermission" || map.phase === "gameover")) {
             details += `  —  CT ${ct} : ${t} T`;
         }
         if (settings.store.showRound && rnd > 0) details += `  —  Round ${rnd}`;
 
         let state = `${modeLabel}  —  ${phase}`;
+
+        // show premier rating in the state line if we have it
+        if (isActuallyPremier && premierRating !== null) {
+            state += `  —  ${premierRating.toLocaleString()} Rating`;
+        }
+
         if (!spectating && settings.store.showKDA && player?.match_stats) {
             const { kills, deaths, assists } = player.match_stats;
             state += `  —  ${kills} / ${deaths} / ${assists}`;
@@ -579,6 +646,10 @@ async function buildAndSet(gs: CS2State) {
 
         const knownMap = !!MAPS[map.name];
         let largeText = knownMap ? `${mn}  —  ${modeLabel}` : `${mn}  —  Community Map`;
+        // show premier rating in tooltip too if space allows
+        if (isActuallyPremier && premierRating !== null) {
+            largeText += `  —  ${premierRating.toLocaleString()} CS Rating`;
+        }
         if (!spectating && settings.store.showHealth && player?.state?.health !== undefined) {
             largeText += `  —  ${player.state.health} HP`;
         }
@@ -718,6 +789,8 @@ export default definePlugin({
         inMatch = false;
         faceitPlayerId = null;
         faceitLive = null;
+        premierRating = null;
+        premierRatingFetched = false;
         steamLobby = { lobbyId: null, partySize: 1 };
         assetCache.clear();
 
