@@ -57,30 +57,66 @@ interface CS2State {
     allplayers?: Record<string, unknown>;
 }
 
-// faceit api responses
+// faceit api responses — expanded to get everything useful
 interface FaceitPlayer {
-    player_id: string;
-    nickname: string;
+    player_id:  string;
+    nickname:   string;
+    country:    string;
+    avatar:     string;
+    faceit_url: string;
     games?: {
         cs2?: {
-            faceit_elo: number;
-            skill_level: number;
+            faceit_elo:   number;
+            skill_level:  number;
+            region:       string;
+            game_player_name: string;
         };
+    };
+    lifetime?: {
+        "Average K/D Ratio":     string;
+        "Average Headshots %":   string;
+        "Win Rate %":            string;
+        "Current Win Streak":    string;
+        "Longest Win Streak":    string;
+        "Total Headshots %":     string;
+        Matches:                 string;
+        Wins:                    string;
     };
 }
 
 interface FaceitMatchTeam {
     faction_id: string;
-    name: string;
-    roster: Array<{ player_id: string; nickname: string }>;
+    name:       string;
+    avatar:     string;
+    roster: Array<{
+        player_id:   string;
+        nickname:    string;
+        avatar:      string;
+        skill_level: number;
+        game_player_name: string;
+    }>;
+    stats?: { winRate: number; recentResults: number[] };
 }
 
 interface FaceitMatch {
-    match_id: string;
-    status: string;
-    voting?: { map?: { pick: string[] } };
+    match_id:      string;
+    status:        string;
+    game_id:       string;
+    region:        string;
+    competition_name?: string;
+    competition_type?: string;
+    best_of:       number;
+    calculate_elo: boolean;
+    started_at:    number;
+    voting?: {
+        map?:  { pick: string[]; entities: Array<{ guid: string; game_map_id: string; name: string }> };
+        voted_entity_types?: string[];
+    };
     teams: { faction1: FaceitMatchTeam; faction2: FaceitMatchTeam };
-    results?: { score: { faction1: number; faction2: number } };
+    results?: {
+        score:  { faction1: number; faction2: number };
+        winner: string;
+    };
     faceit_url: string;
 }
 
@@ -110,34 +146,24 @@ interface SteamLobby {
     partySize: number;
 }
 
-// figure out what kind of server we're on
-// faceit uses scrimcomp5 for 5v5, scrimcomp2 for 2v2
-// anything else thats not a valve mode = community server
+// server type detection
+// FACEIT doesn't have a unique GSI mode — it runs the same "competitive" mode as valve
+// we detect FACEIT by checking if the FACEIT API returned a live match (faceitLive != null)
+// community = any mode string that's not a known valve mode
 type ServerType = "valve" | "faceit" | "community";
 
-// active duty maps — only premier plays all of these via veto
-// competitive lets you pick specific maps so if we see a veto that used all of these, its premier
-const PREMIER_MAPS = new Set([
-    "de_dust2", "de_mirage", "de_inferno", "de_nuke",
-    "de_ancient", "de_anubis", "de_vertigo", "de_overpass",
-]);
-
-// cs2 sends mode="competitive" for BOTH competitive and premier
-// the only reliable gsi signal is num_matches_to_win_series:
-//   premier = 1 (bo1 from veto)
-//   competitive = 0 or undefined (you pick the map directly)
+// premier uses num_matches_to_win_series = 1 in GSI (it's always a bo1 from veto)
+// competitive = 0 or absent (you queue directly into a specific map)
 function isPremier(gs: CS2State): boolean {
     if (!gs.map) return false;
-    // num_matches_to_win_series is 1 in premier, not set in competitive
-    if (gs.map.num_matches_to_win_series === 1) return true;
-    return false;
+    return gs.map.num_matches_to_win_series === 1;
 }
 
-function getServerType(gs: CS2State): ServerType {
+function getServerType(gs: CS2State, hasFaceitMatch: boolean): ServerType {
+    // faceit is detected by the api, not by gsi mode string
+    if (hasFaceitMatch) return "faceit";
+
     const mode = gs.map?.mode ?? "";
-
-    if (mode === "scrimcomp2" || mode === "scrimcomp5") return "faceit";
-
     const valveModes = new Set([
         "competitive", "premier", "casual", "deathmatch",
         "gungameprogressive", "gungametrbomb", "skirmish",
@@ -186,16 +212,13 @@ const MODES: Record<string, { name: string; maxParty: number }> = {
     cooperative:        { name: "Guardian",          maxParty: 2  },
     coopmission:        { name: "Co-op Mission",     maxParty: 2  },
     retakes:            { name: "Retakes",           maxParty: 5  },
-    scrimcomp2:         { name: "FACEIT 2v2",        maxParty: 2  },
-    scrimcomp5:         { name: "FACEIT 5v5",        maxParty: 5  },
     custom:             { name: "Custom / Workshop", maxParty: 10 },
 };
 
 // modes that have actual CT vs T teams (dont show score for DM etc)
 const TEAM_MODES = new Set([
     "competitive", "premier", "casual", "gungametrbomb",
-    "skirmish", "cooperative", "coopmission", "retakes",
-    "scrimcomp2", "scrimcomp5", "custom",
+    "skirmish", "cooperative", "coopmission", "retakes", "custom",
 ]);
 
 const FACEIT_LEVELS: Record<number, string> = {
@@ -339,14 +362,25 @@ let steamLobby: SteamLobby = { lobbyId: null, partySize: 1 };
 let premierRating: number | null = null;
 let premierRatingFetched = false; // so we only try once per session
 
-// faceit live match data
+// everything we can get from faceit api about a live match
 interface FaceitLive {
-    matchId: string;
-    mapName: string;
-    score: { us: number; them: number };
-    elo: number;
-    level: number;
-    matchUrl: string;
+    matchId:        string;
+    mapName:        string;                         // raw map name like "de_mirage"
+    score:          { us: number; them: number };
+    elo:            number;                         // current elo
+    level:          number;                         // 1-10
+    matchUrl:       string;
+    myTeamName:     string;
+    enemyTeamName:  string;
+    myTeamSize:     number;                         // 2 for wingman, 5 for 5v5
+    region:         string;                         // EU, NA, etc
+    bestOf:         number;                         // usually 1
+    competitionName: string | null;                 // hub or queue name
+    kdRatio:        string | null;                  // lifetime K/D from player stats
+    winRate:        string | null;                  // lifetime win rate
+    avgHs:          string | null;                  // avg headshot %
+    startedAt:      number | null;                  // unix timestamp when match started
+    calculateElo:   boolean;                        // whether this match affects elo
 }
 
 let faceitLive: FaceitLive | null = null;
@@ -497,26 +531,49 @@ async function fetchFaceitMatch(steamId: string): Promise<FaceitLive | null> {
 }
 
 async function buildFaceitData(match: FaceitMatch, playerId: string): Promise<FaceitLive | null> {
-    const playerData = await faceitGet<FaceitPlayer>(`/players/${playerId}`);
-    const elo = playerData?.games?.cs2?.faceit_elo ?? 0;
+    // fetch player info and lifetime stats in parallel to save time
+    const [playerData, statsData] = await Promise.all([
+        faceitGet<FaceitPlayer>(`/players/${playerId}`),
+        faceitGet<{ lifetime: FaceitPlayer["lifetime"] }>(`/players/${playerId}/stats/cs2`),
+    ]);
+
+    const elo   = playerData?.games?.cs2?.faceit_elo  ?? 0;
     const level = playerData?.games?.cs2?.skill_level ?? 0;
 
-    const myTeam = Object.values(match.teams).find(t =>
-        t.roster.some(r => r.player_id === playerId)
-    );
+    const lifetime = statsData?.lifetime ?? playerData?.lifetime;
+    const kdRatio  = lifetime?.["Average K/D Ratio"]  ?? null;
+    const winRate  = lifetime?.["Win Rate %"]          ?? null;
+    const avgHs    = lifetime?.["Average Headshots %"] ?? null;
 
-    const mapName = match.voting?.map?.pick?.[0] ?? "Unknown Map";
-    const score = match.results?.score ?? { faction1: 0, faction2: 0 };
-    const myFaction = myTeam?.faction_id === "faction1" ? "faction1" : "faction2";
-    const theirFaction = myFaction === "faction1" ? "faction2" : "faction1";
+    const myTeam    = Object.values(match.teams).find(t => t.roster.some(r => r.player_id === playerId));
+    const enemyTeam = Object.values(match.teams).find(t => t.faction_id !== myTeam?.faction_id);
+
+    // map name from voting pick or entities
+    let mapRaw = match.voting?.map?.pick?.[0] ?? null;
+    if (!mapRaw) mapRaw = match.voting?.map?.entities?.[0]?.game_map_id ?? null;
+
+    const score     = match.results?.score ?? { faction1: 0, faction2: 0 };
+    const myFaction = (myTeam?.faction_id ?? "faction1") as "faction1" | "faction2";
+    const enemyFaction: "faction1" | "faction2" = myFaction === "faction1" ? "faction2" : "faction1";
 
     return {
-        matchId: match.match_id,
-        mapName,
-        score: { us: score[myFaction] ?? 0, them: score[theirFaction] ?? 0 },
+        matchId:         match.match_id,
+        mapName:         mapRaw ?? "Unknown Map",
+        score:           { us: score[myFaction] ?? 0, them: score[enemyFaction] ?? 0 },
         elo,
         level,
-        matchUrl: match.faceit_url.replace("{lang}", "en"),
+        matchUrl:        match.faceit_url.replace("{lang}", "en"),
+        myTeamName:      myTeam?.name    ?? "Our Team",
+        enemyTeamName:   enemyTeam?.name ?? "Enemy Team",
+        myTeamSize:      myTeam?.roster?.length ?? 5,
+        region:          match.region ?? "",
+        bestOf:          match.best_of ?? 1,
+        competitionName: match.competition_name ?? null,
+        kdRatio,
+        winRate,
+        avgHs,
+        startedAt:       match.started_at ? match.started_at * 1000 : null,
+        calculateElo:    match.calculate_elo ?? true,
     };
 }
 
@@ -543,7 +600,7 @@ async function buildAndSet(gs: CS2State) {
     const map = gs.map;
     const round = gs.round;
     const mySteamId = gs.provider?.steamid;
-    const serverType = map ? getServerType(gs) : "valve";
+    const serverType = map ? getServerType(gs, faceitLive !== null) : "valve";
 
     // track match state
     if (map) {
@@ -566,25 +623,50 @@ async function buildAndSet(gs: CS2State) {
 
     const spectating = !!(mySteamId && player?.steamid && player.steamid !== mySteamId);
 
-    // faceit match
+    // faceit match — show as much info as possible
     if (inMatch && map && serverType === "faceit" && faceitLive) {
-        const mn = mapName(faceitLive.mapName);
-        const img = await resolveAsset(mapAsset(faceitLive.mapName));
+        const fl  = faceitLive;
+        const mn  = mapName(fl.mapName);
+        const img = await resolveAsset(mapAsset(fl.mapName));
         const faceitIcon = await resolveAsset("faceit_logo");
 
-        let details = `FACEIT  —  ${mn}  —  ${faceitLive.score.us} : ${faceitLive.score.them}`;
-        if (settings.store.showRound && map.round > 0) details += `  —  Round ${map.round}`;
+        const phase    = roundPhaseLabel(map.phase, round?.phase, round?.bomb);
+        const roundNum = map.round ?? 0;
+        const levelStr = FACEIT_LEVELS[fl.level] ?? `Level ${fl.level}`;
 
-        let state = `${FACEIT_LEVELS[faceitLive.level] ?? "Level ?"} (${faceitLive.elo} ELO)`;
+        // details line: "FACEIT  —  Mirage  —  8 : 5  —  Round 14"
+        let details = `FACEIT  —  ${mn}  —  ${fl.score.us} : ${fl.score.them}`;
+        if (settings.store.showRound && roundNum > 0) details += `  —  Round ${roundNum}`;
+
+        // state line: "Level 9 (2847 ELO)  —  Buy Phase  —  12 / 3 / 2"
+        let state = `${levelStr}  (${fl.elo.toLocaleString()} ELO)  —  ${phase}`;
         if (!spectating && settings.store.showKDA && player?.match_stats) {
             const { kills, deaths, assists } = player.match_stats;
             state += `  —  ${kills} / ${deaths} / ${assists}`;
+        } else if (spectating) {
+            state += "  —  Spectating";
         }
 
-        let largeText = `FACEIT  —  ${mn}`;
+        // large image tooltip: "Mirage  —  FACEIT  —  87 HP  —  K/D: 1.42  —  HS: 48%"
+        let largeText = `${mn}  —  FACEIT`;
+        if (fl.region) largeText += `  (${fl.region})`;
         if (!spectating && settings.store.showHealth && player?.state?.health !== undefined) {
             largeText += `  —  ${player.state.health} HP`;
         }
+        if (fl.kdRatio)  largeText += `  —  K/D ${fl.kdRatio}`;
+        if (fl.avgHs)    largeText += `  —  HS ${fl.avgHs}%`;
+
+        // small icon tooltip: "Level 9  —  Our Team vs Enemy Team  —  BO1"
+        let smallText = levelStr;
+        if (fl.myTeamName && fl.enemyTeamName) {
+            smallText += `  —  ${fl.myTeamName} vs ${fl.enemyTeamName}`;
+        }
+        if (fl.bestOf > 1) smallText += `  —  BO${fl.bestOf}`;
+        if (fl.competitionName) smallText += `  —  ${fl.competitionName}`;
+        if (!fl.calculateElo) smallText += "  —  No ELO";
+
+        // use match start time from faceit api if available, fallback to gsi
+        const tsStart = fl.startedAt ?? matchStart ?? undefined;
 
         setActivity({
             application_id: APP_ID,
@@ -593,14 +675,12 @@ async function buildAndSet(gs: CS2State) {
             details, state,
             assets: {
                 large_image: img,
-                large_text: largeText,
+                large_text:  largeText,
                 small_image: faceitIcon,
-                small_text: "FACEIT",
+                small_text:  smallText,
             },
-            timestamps: matchStart ? { start: matchStart } : undefined,
-            buttons: faceitLive.matchUrl
-                ? [{ label: "View Match", url: faceitLive.matchUrl }]
-                : undefined,
+            timestamps: tsStart ? { start: tsStart } : undefined,
+            buttons: fl.matchUrl ? [{ label: "View Match", url: fl.matchUrl }] : undefined,
         });
         return;
     }
@@ -773,7 +853,7 @@ function stopPolling() {
 export default definePlugin({
     name: "CS2RichPresence",
     description: "Live CS2 rich presence — supports Valve, FACEIT and community servers. Shows map, score, K/D/A, ELO, lobby size.",
-    authors: [{ name: "k1ng_op", id: 641266820187160576n }],
+    authors: [{ name: "Mubashir", id: 641266820187160576n }],
     settings,
 
     async start() {
