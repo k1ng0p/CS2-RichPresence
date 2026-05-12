@@ -580,13 +580,28 @@ async function buildFaceitData(match: FaceitMatch, playerId: string): Promise<Fa
 function startFaceitPolling(steamId: string) {
     if (faceitTimer || !settings.store.faceitApiKey?.trim()) return;
 
+    // poll fast (every 3s) until we get data, then slow to normal interval
+    // this way it detects faceit within a few seconds instead of waiting 15s
+    let gotData = false;
+    const FAST_INTERVAL = 3_000;
+
     const tick = async () => {
-        faceitLive = await fetchFaceitMatch(steamId);
+        const data = await fetchFaceitMatch(steamId);
+        if (data !== null) {
+            faceitLive = data;
+            if (!gotData) {
+                // first time we got data — restart timer at normal interval
+                gotData = true;
+                clearInterval(faceitTimer!);
+                faceitTimer = setInterval(tick, FACEIT_POLL);
+            }
+        }
+        // always rebuild regardless so faceit state shows up immediately
         if (lastGS) buildAndSet(lastGS);
     };
 
-    tick();
-    faceitTimer = setInterval(tick, FACEIT_POLL);
+    tick(); // immediate first call
+    faceitTimer = setInterval(tick, FAST_INTERVAL);
 }
 
 function stopFaceitPolling() {
@@ -605,8 +620,20 @@ async function buildAndSet(gs: CS2State) {
     // track match state
     if (map) {
         inMatch = true;
-        // store the real resolved mode — "premier" instead of "competitive" when applicable
-        if (map.mode) activeMode = (map.mode === "competitive" && isPremier(gs)) ? "premier" : map.mode;
+        // only resolve premier if we're sure its not faceit
+        // faceit uses same mode="competitive" so dont flag it as premier
+        // if faceit api key is set, wait for faceitLive before resolving mode
+        const hasFaceitKey = !!settings.store.faceitApiKey?.trim();
+        const couldBeFaceit = hasFaceitKey && faceitLive === null;
+        if (map.mode) {
+            if (couldBeFaceit) {
+                activeMode = map.mode; // stay as "competitive" until faceit data arrives
+            } else {
+                activeMode = (map.mode === "competitive" && isPremier(gs) && faceitLive === null)
+                    ? "premier"
+                    : map.mode;
+            }
+        }
 
         if (map.name !== lastMapName) {
             lastMapName = map.name;
@@ -853,7 +880,7 @@ function stopPolling() {
 export default definePlugin({
     name: "CS2RichPresence",
     description: "Live CS2 rich presence — supports Valve, FACEIT and community servers. Shows map, score, K/D/A, ELO, lobby size.",
-    authors: [{ name: "Mubashir", id: 641266820187160576n }],
+    authors: [{ name: "k1ng_op", id: 641266820187160576n }],
     settings,
 
     async start() {
