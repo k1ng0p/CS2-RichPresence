@@ -154,8 +154,11 @@ type ServerType = "valve" | "faceit" | "community";
 
 // premier uses num_matches_to_win_series = 1 in GSI (it's always a bo1 from veto)
 // competitive = 0 or absent (you queue directly into a specific map)
+// NOTE: wingman also uses num_matches_to_win_series = 1, so only flag premier
+// when mode is "competitive" AND we don't have faceit data AND it's not wingman
 function isPremier(gs: CS2State): boolean {
     if (!gs.map) return false;
+    if (gs.map.mode === "scrimcomp2v2") return false; // wingman, not premier
     return gs.map.num_matches_to_win_series === 1;
 }
 
@@ -167,6 +170,7 @@ function getServerType(gs: CS2State, hasFaceitMatch: boolean): ServerType {
     const valveModes = new Set([
         "competitive", "premier", "casual", "deathmatch",
         "gungameprogressive", "gungametrbomb", "skirmish",
+        "scrimcomp2v2",  // wingman — internally scrimcomp2v2 per valve wiki
         "survival", "training", "cooperative", "coopmission", "retakes",
     ]);
 
@@ -207,6 +211,7 @@ const MODES: Record<string, { name: string; maxParty: number }> = {
     gungameprogressive: { name: "Arms Race",         maxParty: 6  },
     gungametrbomb:      { name: "Demolition",        maxParty: 5  },
     skirmish:           { name: "Skirmish",          maxParty: 5  },
+    scrimcomp2v2:       { name: "Wingman",           maxParty: 2  },
     survival:           { name: "Danger Zone",       maxParty: 3  },
     training:           { name: "Training",          maxParty: 1  },
     cooperative:        { name: "Guardian",          maxParty: 2  },
@@ -218,7 +223,7 @@ const MODES: Record<string, { name: string; maxParty: number }> = {
 // modes that have actual CT vs T teams (dont show score for DM etc)
 const TEAM_MODES = new Set([
     "competitive", "premier", "casual", "gungametrbomb",
-    "skirmish", "cooperative", "coopmission", "retakes", "custom",
+    "skirmish", "scrimcomp2v2", "cooperative", "coopmission", "retakes", "custom",
 ]);
 
 const FACEIT_LEVELS: Record<number, string> = {
@@ -505,12 +510,27 @@ async function faceitGet<T>(path: string): Promise<T | null> {
 async function getFaceitPlayerId(steamId: string): Promise<string | null> {
     if (faceitPlayerId) return faceitPlayerId;
 
-    const res = await faceitGet<{ items: FaceitPlayer[] }>(`/players?game=cs2&game_player_id=${steamId}`);
-    const player = res?.items?.[0];
+    // FACEIT API: look up player by Steam ID
+    // endpoint: GET /players?game=cs2&game_player_id={steam64id}
+    const res = await faceitGet<{ items?: FaceitPlayer[]; player_id?: string }>(`/players?game=cs2&game_player_id=${steamId}`);
+
+    // API can return either items array or direct player object
+    const player = res?.items?.[0] ?? (res?.player_id ? res as unknown as FaceitPlayer : null);
     if (player?.player_id) {
         faceitPlayerId = player.player_id;
+        logger.info(`FACEIT player found: ${player.player_id}`);
         return player.player_id;
     }
+
+    // also try direct player lookup by Steam ID
+    const direct = await faceitGet<FaceitPlayer>(`/players?game=cs2&game_player_id=${steamId}&limit=1`);
+    if (direct?.player_id) {
+        faceitPlayerId = direct.player_id;
+        logger.info(`FACEIT player found (direct): ${direct.player_id}`);
+        return direct.player_id;
+    }
+
+    logger.warn(`FACEIT: no player found for Steam ID ${steamId} — check your Steam ID is linked to your FACEIT account`);
     return null;
 }
 
@@ -518,14 +538,20 @@ async function fetchFaceitMatch(steamId: string): Promise<FaceitLive | null> {
     const playerId = await getFaceitPlayerId(steamId);
     if (!playerId) return null;
 
-    // try active match endpoint first
+    // try active match endpoint first — most reliable for live matches
     const active = await faceitGet<FaceitMatch>(`/players/${playerId}/active-match`);
-    if (active?.status === "ONGOING") return buildFaceitData(active, playerId);
+    if (active?.status === "ONGOING") {
+        logger.info(`FACEIT: live match found ${active.match_id}`);
+        return buildFaceitData(active, playerId);
+    }
 
-    // fallback to history
+    // fallback to match history
     const history = await faceitGet<{ items: FaceitMatch[] }>(`/players/${playerId}/history?game=cs2&limit=1`);
     const match = history?.items?.[0];
-    if (match?.status === "ONGOING") return buildFaceitData(match, playerId);
+    if (match?.status === "ONGOING") {
+        logger.info(`FACEIT: live match found via history ${match.match_id}`);
+        return buildFaceitData(match, playerId);
+    }
 
     return null;
 }
